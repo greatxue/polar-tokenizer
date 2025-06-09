@@ -38,7 +38,7 @@ class Decoder(nn.Module):
     def forward(self, x):
         return self.inverse_conv_stack(x)
 
-
+    
 if __name__ == "__main__":
     # random data
     x = np.random.random_sample((3, 40, 40, 200))

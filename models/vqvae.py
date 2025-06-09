@@ -20,7 +20,6 @@ class VQVAE(nn.Module):
             n_embeddings, embedding_dim, beta)
         # decode the discrete latent representation
         self.decoder = Decoder(embedding_dim, h_dim, n_res_layers, res_h_dim)
-
         if save_img_embedding_map:
             self.img_to_embedding_map = {i: [] for i in range(n_embeddings)}
         else:

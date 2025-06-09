@@ -2,97 +2,121 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def poincare_to_hyperboloid(x):
+    """
+    x: (..., e_dim), ‖x‖ < 1 (Poincaré ball)
+    returns u: (..., e_dim+1) s.t. -u0^2 + sum(u_i^2) = -1
+    """
+    sq_norm = torch.sum(x * x, dim=-1, keepdim=True)  # (...,1)
+    denom   = 1.0 - sq_norm                            # (...,1)
+    u0      = (1.0 + sq_norm) / denom                  # (...,1)
+    u_spatial = 2.0 * x / denom                        # (..., e_dim)
+    return torch.cat([u0, u_spatial], dim=-1)
+
+def lorentz_inner(u, v):
+    # u,v: (..., e_dim+1)
+    return -u[...,0]*v[...,0] + torch.sum(u[...,1:]*v[...,1:], dim=-1)
+
+def lorentz_distance(u, v):
+    # on hyperboloid: d(u,v) = arccosh( -⟨u,v⟩ )
+    prod = -lorentz_inner(u, v)
+    prod = torch.clamp(prod, min=1.0 + 1e-5)
+    return torch.acosh(prod)
+
+def from_polar(r, w):
+    """
+    r: (...), hyperbolic radius
+    w: (..., e_dim), unit vector in tangent/Euc space
+    returns x in Poincaré ball: x = tanh(r/2) * w
+    """
+    return torch.tanh(r.unsqueeze(-1) / 2.0) * w
 
 class VectorQuantizer(nn.Module):
-    def __init__(self, n_e, e_dim, beta):
-        super(VectorQuantizer, self).__init__()
-        self.n_e = n_e
-        self.e_dim = e_dim
-        self.beta = beta
+    def __init__(self, n_e, e_dim, beta, radial_bins=8, max_radius=12.0):
+        super().__init__()
+        assert n_e % radial_bins == 0, "n_e 必须被 radial_bins 整除"
+        self.n_e          = n_e
+        self.e_dim        = e_dim           # Poincaré 球的空间维度
+        self.beta         = beta
+        self.radial_bins  = radial_bins
+        self.angular_bins = n_e // radial_bins
+        self.max_radius   = max_radius
 
-        # 初始化嵌入向量，不使用 EMA 更新
-        self.embedding = nn.Embedding(self.n_e, self.e_dim)
-        nn.init.kaiming_uniform_(self.embedding.weight)
+        # 径向中心（超曲半径 r）
+        log_r = torch.linspace(0., torch.log(torch.tensor(max_radius)), radial_bins)
+        self.r_centres = nn.Parameter(torch.exp(log_r))  # (radial_bins,)
 
-    def forward_(self, z):
-        # reshape z -> (batch, height, width, channel) 并 flatten
-        z = z.permute(0, 2, 3, 1).contiguous()
-        z_flattened = z.view(-1, self.e_dim)
-
-        # 归一化
-        z_flattened_norm = F.normalize(z_flattened, dim=-1)
-        embedding_norm = F.normalize(self.embedding.weight, dim=-1)
-
-        # 计算余弦相似度
-        d = 1 - torch.matmul(z_flattened_norm, embedding_norm.t())
-
-        # 找最近编码
-        min_encoding_indices = torch.argmin(d, dim=1).unsqueeze(1)
-        min_encodings = torch.zeros(
-            min_encoding_indices.shape[0], self.n_e,
-            device=z.device
-        ).scatter_(1, min_encoding_indices, 1)
-
-        # 量化向量
-        z_q = torch.matmul(min_encodings, self.embedding.weight).view(z.shape)
-
-        # 损失计算
-        commitment_loss = F.mse_loss(z_q.detach(), z)
-        codebook_loss = F.mse_loss(z_q, z.detach())
-        loss = commitment_loss + self.beta * codebook_loss
-
-        # 梯度直通
-        z_q = z + (z_q - z).detach()
-
-        # 困惑度 & 使用率
-        e_mean = torch.mean(min_encodings, dim=0)
-        perplexity = torch.exp(-torch.sum(e_mean * torch.log(e_mean + 1e-10)))
-        used_codes = (min_encodings.sum(0) > 0).float().sum()
-        codebook_usage = used_codes / self.n_e
-
-        # reshape 回 (batch, channel, height, width)
-        z_q = z_q.permute(0, 3, 1, 2).contiguous()
-
-        return loss, z_q, perplexity, min_encodings, min_encoding_indices, codebook_usage
+        # 角度中心：R^e_dim 上的单位向量
+        self.angular_codebook = nn.Embedding(self.angular_bins, self.e_dim)
+        with torch.no_grad():
+            v = torch.randn(self.angular_bins, self.e_dim)
+            self.angular_codebook.weight.copy_(F.normalize(v, dim=-1))
 
     def forward(self, z):
-        # reshape z -> (batch, height, width, channel) 并 flatten
-        z = z.permute(0, 2, 3, 1).contiguous()
-        z_flattened = z.view(-1, self.e_dim)
+        """
+        z: (B, C=e_dim, H, W)
+        returns: loss, z_q (B,C,H,W), perplexity, one-hot, indices
+        """
+        B, C, H, W = z.shape
+        assert C == self.e_dim
 
-        # 归一化
-        z_flattened_norm = F.normalize(z_flattened, dim=-1)
-        embedding_norm = F.normalize(self.embedding.weight, dim=-1)
+        # flatten to (N, e_dim)
+        z_flat = z.permute(0,2,3,1).reshape(-1, C)  # N = B*H*W
 
-        # 计算余弦相似度
-        d = 1 - torch.matmul(z_flattened_norm, embedding_norm.t())
+        # --- 1) 投影到 Poincaré 球 ---
+        norm_euc = torch.clamp(torch.norm(z_flat, dim=-1, keepdim=True), min=1e-5)
+        x_poinc  = (z_flat / norm_euc) * torch.tanh(norm_euc)  # (..., e_dim)
 
-        # 找最近编码
-        min_encoding_indices = torch.argmin(d, dim=1).unsqueeze(1)
-        min_encodings = torch.zeros(
-            min_encoding_indices.shape[0], self.n_e,
-            device=z.device
-        ).scatter_(1, min_encoding_indices, 1)
+        # --- 2) 球 → 超曲面 用于距离计算 & 半径提取 ---
+        u_hyp = poincare_to_hyperboloid(x_poinc)               # (..., e_dim+1)
 
-        # 量化向量
-        z_q = torch.matmul(min_encodings, self.embedding.weight).view(z.shape)
+        # 超曲半径 r = arccosh(u0)
+        u0 = u_hyp[..., 0]                                     # (...,)
+        r  = torch.acosh(torch.clamp(u0, min=1.0 + 1e-5))      # (...,)
 
-        # 损失计算：去掉 usage_loss
-        commitment_loss = F.mse_loss(z_q.detach(), z)
-        codebook_loss = F.mse_loss(z_q, z.detach())
-        loss = commitment_loss + self.beta * codebook_loss
+        # 方向单位向量（在 Poinc 球里）
+        w = F.normalize(x_poinc, dim=-1)                       # (..., e_dim)
 
-        # 梯度直通
-        z_q = z + (z_q - z).detach()
+        # --- 3) 径向量化 ---
+        r_centres = torch.clamp(self.r_centres, min=1e-2, max=self.max_radius)  # (radial_bins,)
+        dist_r2   = (r.unsqueeze(-1) - r_centres)**2                             # (..., radial_bins)
+        r_idx     = dist_r2.argmin(dim=-1)                                        # (...,)
+        r_q       = r_centres[r_idx]                                             # (...,)
 
-        # 困惑度 & 使用率
-        e_mean = torch.mean(min_encodings, dim=0)
+        # --- 4) 角度量化 ---
+        sim       = torch.matmul(w, self.angular_codebook.weight.t())  # (..., angular_bins)
+        w_idx     = sim.argmax(dim=-1)                                # (...,)
+        w_q       = self.angular_codebook(w_idx)                      # (..., e_dim)
+
+        # --- 5) 重建 Poincaré 点 & 超曲面用于 loss ---
+        x_q_poinc = from_polar(r_q, w_q)                              # (..., e_dim)
+        u_q_hyp   = poincare_to_hyperboloid(x_q_poinc)               # (..., e_dim+1)
+
+        # --- 6) 量化损失 ---
+        commit_loss   = torch.mean(lorentz_distance(u_hyp.detach(),   u_q_hyp)**2)
+        codebook_loss = torch.mean(lorentz_distance(u_hyp, u_q_hyp.detach())**2)
+        loss = commit_loss + self.beta * codebook_loss
+
+        # --- 7) Straight-through estimator 回流 ---
+        x_q_poinc = x_poinc + (x_q_poinc - x_poinc).detach()
+
+        # reshape 回 (B, C, H, W)
+        z_q = x_q_poinc.view(B, H, W, C).permute(0,3,1,2).contiguous()
+
+        # --- 8) Perplexity & one-hot ---
+        N = z_flat.shape[0]
+        one_hot = torch.zeros(N, self.n_e, device=z.device)
+        ids = r_idx * self.angular_bins + w_idx               # (...,)
+        one_hot.scatter_(1, ids.view(-1,1), 1.0)
+        e_mean     = torch.mean(one_hot, dim=0)
         perplexity = torch.exp(-torch.sum(e_mean * torch.log(e_mean + 1e-10)))
-        used_codes = (min_encodings.sum(0) > 0).float().sum()
+        
+        used_codes = (one_hot.sum(dim=0) > 0).float().sum()
         codebook_usage = used_codes / self.n_e
+        
+        with torch.no_grad():
+            self.angular_codebook.weight.data.copy_(
+                F.normalize(self.angular_codebook.weight.data, dim=-1)
+            )        
 
-        # reshape 回 (batch, channel, height, width)
-        z_q = z_q.permute(0, 3, 1, 2).contiguous()
-
-        return loss, z_q, perplexity, min_encodings, min_encoding_indices, codebook_usage
+        return loss, z_q, perplexity, one_hot, ids.view(-1,1), codebook_usage

@@ -41,7 +41,8 @@ class Encoder(nn.Module):
 
     def forward(self, x):
         return self.conv_stack(x)
-
+    
+    
 
 if __name__ == "__main__":
     # random data
