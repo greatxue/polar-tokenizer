@@ -110,5 +110,8 @@ class VectorQuantizer(nn.Module):
         one_hot.scatter_(1, ids.view(-1,1), 1.0)
         e_mean     = torch.mean(one_hot, dim=0)
         perplexity = torch.exp(-torch.sum(e_mean * torch.log(e_mean + 1e-10)))
+        
+        used_codes = (one_hot.sum(dim=0) > 0).float().sum()
+        codebook_usage = used_codes / self.n_e
 
-        return loss, z_q, perplexity, one_hot, ids.view(-1,1)
+        return loss, z_q, perplexity, one_hot, ids.view(-1,1), codebook_usage

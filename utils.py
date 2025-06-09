@@ -7,6 +7,25 @@ import os
 from datasets.block import BlockDataset, LatentBlockDataset
 import numpy as np
 
+def calculate_imagenet_var(dataloader, num_batches=50):
+    """使用批处理计算数据集方差"""
+    print("计算数据集方差...")
+    running_var = 0.0
+    count = 0
+    
+    for i, (batch, _) in enumerate(dataloader):
+        if i >= num_batches:  # 只使用部分批次计算方差
+            break
+        # 计算当前批次的方差
+        batch_var = torch.var(batch).item()
+        running_var += batch_var
+        count += 1
+        if i % 10 == 0:
+            print(f"已处理 {i}/{num_batches} 批次")
+    
+    final_var = running_var / count if count > 0 else 0
+    print(f"方差计算完成: {final_var:.6f}")
+    return final_var
 
 def load_cifar():
     train = datasets.CIFAR10(root="data", train=True, download=True,
@@ -24,6 +43,73 @@ def load_cifar():
                            ]))
     return train, val
 
+import torchvision.datasets as datasets
+import torchvision.transforms as transforms
+
+def load_imagenet_(data_dir="/home/zhongkai/project/polar-tokenizer/data/imagenet"):
+    transform = transforms.Compose([
+        transforms.Resize(128),  
+        transforms.CenterCrop(128),
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+    ])
+    train = datasets.ImageFolder(root=f"{data_dir}/train", transform=transform)
+    val = datasets.ImageFolder(root=f"{data_dir}/val", transform=transform)
+    return train, val
+import os
+
+
+def load_imagenet(data_dir="/home/zhongkai/project/polar-tokenizer/data/imagenet"):
+    print(f"尝试加载数据集，路径: {data_dir}")
+    
+    # 检查目录是否存在
+    if not os.path.exists(data_dir):
+        raise FileNotFoundError(f"数据集根目录不存在: {data_dir}")
+    
+    train_dir = os.path.join(data_dir, "train")
+    val_dir = os.path.join(data_dir, "val")
+    
+    # 检查训练和验证集目录
+    if not os.path.exists(train_dir):
+        raise FileNotFoundError(f"训练集目录不存在: {train_dir}")
+    if not os.path.exists(val_dir):
+        raise FileNotFoundError(f"验证集目录不存在: {val_dir}")
+    
+    # 检查目录内容
+    train_classes = os.listdir(train_dir)
+    print(f"训练集目录包含以下内容: {train_classes}")
+    
+    # 检查第一个类别文件夹中的文件
+    if train_classes:
+        first_class = train_classes[0]
+        first_class_path = os.path.join(train_dir, first_class)
+        if os.path.isdir(first_class_path):
+            files = os.listdir(first_class_path)
+            print(f"第一个类别 {first_class} 包含的文件: {files[:5]} ...")
+            print(f"总计文件数: {len(files)}")
+    
+    transform = transforms.Compose([
+        transforms.Resize(128),  
+        transforms.CenterCrop(128),
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+    ])
+    
+    try:
+        train = datasets.ImageFolder(root=train_dir, transform=transform)
+        print(f"成功加载训练集，包含 {len(train)} 张图片")
+    except Exception as e:
+        print(f"加载训练集失败: {str(e)}")
+        raise
+        
+    try:
+        val = datasets.ImageFolder(root=val_dir, transform=transform)
+        print(f"成功加载验证集，包含 {len(val)} 张图片")
+    except Exception as e:
+        print(f"加载验证集失败: {str(e)}")
+        raise
+    
+    return train, val
 
 def load_block():
     data_folder_path = os.getcwd()
@@ -91,6 +177,11 @@ def load_data_and_data_loaders(dataset, batch_size):
             training_data, validation_data, batch_size)
 
         x_train_var = np.var(training_data.data)
+    elif dataset == 'IMAGENET':
+        training_data, validation_data = load_imagenet()
+        training_loader, validation_loader = data_loaders(
+            training_data, validation_data, batch_size)
+        x_train_var = calculate_imagenet_var(training_loader)
 
     else:
         raise ValueError(

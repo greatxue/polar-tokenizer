@@ -65,26 +65,9 @@ results = {
 
 
 def train():
-    # 计算每个 epoch 需要的迭代次数
-    iterations_per_epoch = len(training_loader)
-    print(f"数据集大小: {len(training_data)} 张图片")
-    print(f"批次大小: {args.batch_size}")
-    print(f"每轮需要 {iterations_per_epoch} 次迭代")
-    
-    epoch = 0
-    train_iterator = iter(training_loader)
-    
+
     for i in range(args.n_updates):
-        try:
-            x, _ = next(train_iterator)
-        except StopIteration:
-            # 完成一个 epoch，打印信息
-            epoch += 1
-            print(f"\nEpoch {epoch} 完成")
-            # 重新创建迭代器
-            train_iterator = iter(training_loader)
-            x, _ = next(train_iterator)
-            
+        (x, _) = next(iter(training_loader))
         x = x.to(device)
         optimizer.zero_grad()
 
