@@ -90,7 +90,7 @@ def train():
 
         embedding_loss, x_hat, perplexity, codebook_usage = model(x)
         recon_loss = torch.mean((x_hat - x)**2) / x_train_var
-        loss = recon_loss + embedding_loss
+        loss = recon_loss
 
         loss.backward()
         optimizer.step()

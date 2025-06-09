@@ -46,7 +46,7 @@ def load_cifar():
 import torchvision.datasets as datasets
 import torchvision.transforms as transforms
 
-def load_imagenet_(data_dir="/home/zhongkai/project/polar-tokenizer/data/imagenet"):
+def load_imagenet_(data_dir="/home/zihan/work/ILSVRC2012_img_val"):
     transform = transforms.Compose([
         transforms.Resize(128),  
         transforms.CenterCrop(128),
@@ -59,7 +59,7 @@ def load_imagenet_(data_dir="/home/zhongkai/project/polar-tokenizer/data/imagene
 import os
 
 
-def load_imagenet(data_dir="/home/zhongkai/project/polar-tokenizer/data/imagenet"):
+def load_imagenet(data_dir="/home/zihan/work/ILSVRC2012_img_val"):
     print(f"尝试加载数据集，路径: {data_dir}")
     
     # 检查目录是否存在
