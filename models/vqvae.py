@@ -39,8 +39,11 @@ class VQVAE(nn.Module):
         z_e = self.encoder(x)
 
         z_e = self.pre_quantization_conv(z_e)
-        embedding_loss, z_q, perplexity, _, _, codebook_usage = self.vector_quantization(
+        embedding_loss, z_q, perplexity, _, _, codebook_usage, e_mean  = self.vector_quantization(
             z_e)
+
+        #embedding_loss, z_q, perplexity, _, _, codebook_usage = self.vector_quantization(
+           #z_e)
         x_hat = self.decoder(z_q)
 
         if verbose:
@@ -49,4 +52,5 @@ class VQVAE(nn.Module):
             print('recon data shape:', x_hat.shape)
             assert False
 
-        return embedding_loss, x_hat, perplexity, codebook_usage
+        return embedding_loss, x_hat, perplexity, codebook_usage, e_mean
+        #return embedding_loss, x_hat, perplexity, codebook_usage
