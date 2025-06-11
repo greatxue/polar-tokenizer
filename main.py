@@ -1,11 +1,16 @@
 import numpy as np
 import torch
+import sys
+import os
 import torch.nn as nn
 import torch.optim as optim
 import argparse
 import utils
+import sys
+from PIL import ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True 
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from models.vqvae import VQVAE
-
 parser = argparse.ArgumentParser()
 
 """
@@ -14,14 +19,14 @@ Hyperparameters
 timestamp = utils.readable_timestamp()
 
 parser.add_argument("--batch_size", type=int, default=32)
-parser.add_argument("--n_updates", type=int, default=5000)
+parser.add_argument("--n_updates", type=int, default=1500000)
 parser.add_argument("--n_hiddens", type=int, default=128)
 parser.add_argument("--n_residual_hiddens", type=int, default=32)
 parser.add_argument("--n_residual_layers", type=int, default=2)
 parser.add_argument("--embedding_dim", type=int, default=64)
-parser.add_argument("--n_embeddings", type=int, default=512)
-parser.add_argument("--beta", type=float, default=.25)
-parser.add_argument("--learning_rate", type=float, default=3e-4)
+parser.add_argument("--n_embeddings", type=int, default=8192)
+parser.add_argument("--beta", type=float, default=0.25)
+parser.add_argument("--learning_rate", type=float, default=2e-4)
 parser.add_argument("--log_interval", type=int, default=50)
 parser.add_argument("--dataset",  type=str, default='IMAGENET')
 
@@ -88,11 +93,15 @@ def train():
         x = x.to(device)
         optimizer.zero_grad()
 
-        embedding_loss, x_hat, perplexity, codebook_usage = model(x)
+        embedding_loss, x_hat, perplexity, codebook_usage, e_mean = model(x)
+        #embedding_loss, x_hat, perplexity, codebook_usage = model(x)
         recon_loss = torch.mean((x_hat - x)**2) / x_train_var
-        loss = recon_loss
-
+        codebook_entropy = -torch.sum(e_mean * torch.log(e_mean + 1e-10))
+        loss = recon_loss + 0.01 * embedding_loss + 0.1 * codebook_entropy
+        #loss = recon_loss + 0.01 * embedding_loss
+        
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
         results["recon_errors"].append(recon_loss.cpu().detach().numpy())
