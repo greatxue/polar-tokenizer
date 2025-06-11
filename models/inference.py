@@ -3,9 +3,13 @@ from torchvision import transforms
 from PIL import Image
 import matplotlib.pyplot as plt
 import numpy as np
+import os
+import sys
 from torch.serialization import safe_globals, add_safe_globals
-
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # Add numpy globals to safe list
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"使用设备: {device}")
 add_safe_globals([
     'numpy._core.multiarray._reconstruct',
     'numpy.core.multiarray._reconstruct',
@@ -21,17 +25,21 @@ model = VQVAE(
     h_dim=128,
     res_h_dim=32,
     n_res_layers=2,
-    n_embeddings=512,
-    embedding_dim=64,
-    beta=0.25
-).to(device)
+    n_embeddings=8192,  # 关键参数，确保与训练时相同
+    embedding_dim=64,   # 关键参数，确保与训练时相同
+    beta=0.25,
+    save_img_embedding_map=False
+)
+
 
 # ==== 2. 加载模型权重 ====
 checkpoint = torch.load(
-    '/home/zhongkai/project/polar-tokenizer/results/vqvae_data_mon_jun_9_07_27_42_2025.pth',
+    '/ext/work/results/vqvae_data_wed_jun_11_12_31_45_2025.pth',
     map_location=device,
     weights_only=False
 )
+model.load_state_dict(checkpoint['model'])
+model = model.to(device)
 
 if isinstance(checkpoint, dict):
     if 'state_dict' in checkpoint:
@@ -54,22 +62,25 @@ transform = transforms.Compose([
 ])
 
 # ==== 4. 加载原图 ====
-# ==== 4. 加载原图 ====
-img_path = '/home/zhongkai/project/polar-tokenizer/data/imagenet/train/n01443537/ILSVRC2012_val_00000002.jpeg'
+img_path = '/ext/work/ILSVRC2012_img_val/train/n03642806/ILSVRC2012_val_00000660.JPEG'
+#img_path = '/ext/work/ILSVRC2012_img_val/val/n04335435/ILSVRC2012_val_00033110.JPEG'
+#img_path = '/ext/work/ILSVRC2012_img_val/val/n04428191/ILSVRC2012_val_00035701.JPEG'
+#img_path = '/ext/work/ILSVRC2012_img_val/train/n04371774/ILSVRC2012_val_00005319.JPEG'
+#img_path = '/ext/work/ILSVRC2012_img_val/val/n04019541/ILSVRC2012_val_00019105.JPEG'
 img = Image.open(img_path).convert('RGB')
 x = transform(img).unsqueeze(0).to(device)  # 保留原始尺寸
-
+x = x.to(device) 
 # ==== 5. 推理 ====
 with torch.no_grad():
-    loss, z_q, perplexity, codebook_usage = model(x)
+    loss, recon_img_tensor, perplexity, codebook_usage , _= model(x)
     print(f"Codebook usage: {codebook_usage.item():.2%}")
     print(f"Perplexity: {perplexity.item():.2f}")
 
 # ==== 6. 反归一化并直接转成图像 ====
-z_q = z_q.squeeze(0).cpu()
-z_q = z_q * 0.5 + 0.5
-z_q = torch.clamp(z_q, 0, 1)
-recon_img = transforms.ToPILImage()(z_q)   # 不 resize！
+recon_img_tensor = recon_img_tensor.squeeze(0).cpu()
+recon_img_tensor = recon_img_tensor * 0.5 + 0.5
+recon_img_tensor = torch.clamp(recon_img_tensor, 0, 1)
+recon_img = transforms.ToPILImage()(recon_img_tensor)  # 不 resize！
 
 # ==== 7. 尺寸确认 ====
 print(f"原图尺寸: {img.size}")
