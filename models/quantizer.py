@@ -1,18 +1,61 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+def hyperboloid_to_poincare(u):
+    """将洛伦兹模型中的点转换到Poincaré球模型"""
+    return u[..., 1:] / (u[..., 0:1] + 1.0)
 def poincare_to_hyperboloid(x):
-    """
-    x: (..., e_dim), ‖x‖ < 1 (Poincaré ball)
-    returns u: (..., e_dim+1) s.t. -u0^2 + sum(u_i^2) = -1
-    """
-    sq_norm = torch.sum(x * x, dim=-1, keepdim=True)  # (...,1)
-    denom   = 1.0 - sq_norm                            # (...,1)
-    u0      = (1.0 + sq_norm) / denom                  # (...,1)
-    u_spatial = 2.0 * x / denom                        # (..., e_dim)
+    x_norm = torch.sum(x * x, dim=-1, keepdim=True)
+    
+    # 只对超出安全阈值的点进行裁剪
+    too_close_to_boundary = x_norm > 0.999  # 提高阈值
+    
+    # 选择性裁剪
+    x_safe = torch.where(
+        too_close_to_boundary,
+        x * 0.999 / torch.sqrt(x_norm.clamp(min=1e-8)),
+        x
+    )
+    
+    # 其余转换代码不变
+    sq_norm = torch.sum(x_safe * x_safe, dim=-1, keepdim=True)
+    denom = 1.0 - sq_norm
+    denom = torch.clamp(denom, min=1e-6)
+    
+    u0 = (1.0 + sq_norm) / denom
+    u_spatial = 2.0 * x_safe / denom
     return torch.cat([u0, u_spatial], dim=-1)
 
+def exp_map_to_lorentz(v, min_radius=0.1, max_radius=20.0):
+    """使用分位数映射获得更均匀的半径分布"""
+    # 计算范数
+    # 计算范数
+    norm = torch.norm(v, dim=-1, keepdim=True)
+    norm = torch.clamp(norm, min=1e-8)
+    
+    # 使用固定参考范围
+    norm_ref_min = 2   # 根据您数据的最小范数
+    norm_ref_max = 200  # 根据您数据的最大范数
+    
+    # 计算归一化范数
+    norm_normalized = (norm - norm_ref_min) / (norm_ref_max - norm_ref_min)
+    norm_normalized = torch.clamp(norm_normalized, min=0.0, max=1.0)
+    
+    # 映射到目标半径范围
+    target_radius = min_radius + (max_radius - min_radius) * norm_normalized
+    
+    # 计算缩放因子
+    scale_factor = target_radius / norm
+    v_scaled = v * scale_factor
+    
+    # 标准双曲函数计算
+    norm_scaled = torch.norm(v_scaled, dim=-1, keepdim=True)
+    cosh_norm = torch.cosh(norm_scaled)
+    sinh_norm = torch.sinh(norm_scaled)
+    u0 = cosh_norm
+    u_spatial = sinh_norm * (v_scaled / norm_scaled.clamp(min=1e-8))
+    
+    return torch.cat([u0, u_spatial], dim=-1)
 def lorentz_inner(u, v):
     # u,v: (..., e_dim+1)
     return -u[...,0]*v[...,0] + torch.sum(u[...,1:]*v[...,1:], dim=-1)
@@ -20,7 +63,7 @@ def lorentz_inner(u, v):
 def lorentz_distance(u, v):
     # on hyperboloid: d(u,v) = arccosh( -⟨u,v⟩ )
     prod = -lorentz_inner(u, v)
-    prod = torch.clamp(prod, min=1.0 + 1e-5)
+    prod = torch.clamp(prod, min=1.0 + 1e-5)  # 防止数值不稳定
     return torch.acosh(prod)
 
 def from_polar(r, w):
@@ -32,7 +75,7 @@ def from_polar(r, w):
     return torch.tanh(r.unsqueeze(-1) / 2.0) * w
 
 class VectorQuantizer(nn.Module):
-    def __init__(self, n_e, e_dim, beta, radial_bins=8, max_radius=12.0):
+    def __init__(self, n_e, e_dim, beta, radial_bins=16, max_radius=18.0):
         super().__init__()
         assert n_e % radial_bins == 0, "n_e 必须被 radial_bins 整除"
         self.n_e          = n_e
@@ -64,18 +107,17 @@ class VectorQuantizer(nn.Module):
         z_flat = z.permute(0,2,3,1).reshape(-1, C)  # N = B*H*W
 
         # --- 1) 投影到 Poincaré 球 ---
-        norm_euc = torch.clamp(torch.norm(z_flat, dim=-1, keepdim=True), min=1e-5)
-        x_poinc  = (z_flat / norm_euc) * torch.tanh(norm_euc)  # (..., e_dim)
-
-        # --- 2) 球 → 超曲面 用于距离计算 & 半径提取 ---
-        u_hyp = poincare_to_hyperboloid(x_poinc)               # (..., e_dim+1)
+        u_hyp = exp_map_to_lorentz(z_flat)
+             # (..., e_dim+1)
 
         # 超曲半径 r = arccosh(u0)
         u0 = u_hyp[..., 0]                                     # (...,)
         r  = torch.acosh(torch.clamp(u0, min=1.0 + 1e-5))      # (...,)
 
         # 方向单位向量（在 Poinc 球里）
-        w = F.normalize(x_poinc, dim=-1)                       # (..., e_dim)
+        w = F.normalize(u_hyp[..., 1:], dim=-1)
+        
+        x_poinc = hyperboloid_to_poincare(u_hyp)                     # (..., e_dim)
 
         # --- 3) 径向量化 ---
         r_centres = torch.clamp(self.r_centres, min=1e-2, max=self.max_radius)  # (radial_bins,)
@@ -89,12 +131,12 @@ class VectorQuantizer(nn.Module):
         w_q       = self.angular_codebook(w_idx)                      # (..., e_dim)
 
         # --- 5) 重建 Poincaré 点 & 超曲面用于 loss ---
-        x_q_poinc = from_polar(r_q, w_q)                              # (..., e_dim)
+        x_q_poinc = from_polar(r_q, w_q)                                              # (..., e_dim)
         u_q_hyp   = poincare_to_hyperboloid(x_q_poinc)               # (..., e_dim+1)
 
         # --- 6) 量化损失 ---
-        commit_loss   = torch.mean(lorentz_distance(u_hyp.detach(),   u_q_hyp)**2)
-        codebook_loss = torch.mean(lorentz_distance(u_hyp, u_q_hyp.detach())**2)
+        commit_loss   = torch.mean(lorentz_distance(u_hyp.detach(),   u_q_hyp)) 
+        codebook_loss = torch.mean(lorentz_distance(u_hyp, u_q_hyp.detach()))
         loss = commit_loss + self.beta * codebook_loss
 
         # --- 7) Straight-through estimator 回流 ---
@@ -119,4 +161,7 @@ class VectorQuantizer(nn.Module):
                 F.normalize(self.angular_codebook.weight.data, dim=-1)
             )        
 
-        return loss, z_q, perplexity, one_hot, ids.view(-1,1), codebook_usage
+        return loss, z_q, perplexity, one_hot, ids.view(-1,1), codebook_usage, e_mean
+
+
+
