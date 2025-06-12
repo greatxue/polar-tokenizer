@@ -75,7 +75,8 @@ def from_polar(r, w):
     return torch.tanh(r.unsqueeze(-1) / 2.0) * w
 
 class VectorQuantizer(nn.Module):
-    def __init__(self, n_e, e_dim, beta, radial_bins=16, max_radius=18.0):
+    def __init__(self, n_e, e_dim, beta, radial_bins=16, max_radius=18.0, 
+                use_ema=False, ema_decay=0.99):
         super().__init__()
         assert n_e % radial_bins == 0, "n_e 必须被 radial_bins 整除"
         self.n_e          = n_e
@@ -84,6 +85,10 @@ class VectorQuantizer(nn.Module):
         self.radial_bins  = radial_bins
         self.angular_bins = n_e // radial_bins
         self.max_radius   = max_radius
+        
+        # 添加EMA支持
+        self.use_ema = use_ema
+        self.ema_decay = ema_decay
 
         # 径向中心（超曲半径 r）
         log_r = torch.linspace(0., torch.log(torch.tensor(max_radius)), radial_bins)
@@ -94,6 +99,19 @@ class VectorQuantizer(nn.Module):
         with torch.no_grad():
             v = torch.randn(self.angular_bins, self.e_dim)
             self.angular_codebook.weight.copy_(F.normalize(v, dim=-1))
+            
+        # 为EMA更新添加缓冲区
+        if self.use_ema:
+            # 径向EMA缓冲区
+            self.register_buffer('r_centres_ema', self.r_centres.clone().detach())
+            self.register_buffer('r_cluster_size', torch.zeros(radial_bins))
+            
+            # 角度EMA缓冲区
+            self.register_buffer('angular_ema', self.angular_codebook.weight.clone().detach())
+            self.register_buffer('angular_cluster_size', torch.zeros(self.angular_bins))
+            
+            # EMA状态跟踪
+            self.register_buffer('ema_initialized', torch.tensor(0))
 
     def forward(self, z):
         """
@@ -156,12 +174,74 @@ class VectorQuantizer(nn.Module):
         used_codes = (one_hot.sum(dim=0) > 0).float().sum()
         codebook_usage = used_codes / self.n_e
         
+        # --- 9) EMA 更新 ---
+        if self.training and self.use_ema:
+            with torch.no_grad():
+                # 径向编码本EMA更新
+                r_encodings = torch.zeros(self.radial_bins, device=z.device)
+                r_encodings.scatter_add_(0, r_idx, torch.ones_like(r_idx, dtype=torch.float))
+                
+                # 收集要添加到径向编码本的信息
+                r_sum = torch.zeros_like(self.r_centres)
+                r_sum.scatter_add_(0, r_idx, r)
+                
+                # 角度编码本EMA更新
+                w_encodings = torch.zeros(self.angular_bins, device=z.device)
+                w_encodings.scatter_add_(0, w_idx, torch.ones_like(w_idx, dtype=torch.float))
+                
+                # 收集要添加到角度编码本的信息
+                w_sum = torch.zeros(self.angular_bins, self.e_dim, device=z.device)
+                for i in range(w.shape[0]):
+                    w_sum[w_idx[i]] += w[i]
+                
+                # 更新EMA缓冲区
+                if self.ema_initialized.item() == 0:
+                    # 首次更新，直接赋值
+                    self.r_centres_ema.copy_(self.r_centres.data)
+                    self.r_cluster_size.copy_(r_encodings)
+                    
+                    self.angular_ema.copy_(self.angular_codebook.weight.data)
+                    self.angular_cluster_size.copy_(w_encodings)
+                    
+                    self.ema_initialized.fill_(1)
+                else:
+                    # 常规EMA更新
+                    # 更新径向缓冲区
+                    self.r_cluster_size.data = self.r_cluster_size * self.ema_decay + r_encodings * (1 - self.ema_decay)
+                    
+                    # 避免除零
+                    r_non_zero_clusters = (self.r_cluster_size > 1e-5).float()
+                    r_cluster_size = self.r_cluster_size + (1 - r_non_zero_clusters)
+                    
+                    # 计算新的径向中心位置
+                    r_dw = r_sum / r_cluster_size
+                    self.r_centres_ema.data = self.r_centres_ema * self.ema_decay + r_dw * (1 - self.ema_decay)
+                    
+                    # 确保径向中心保持在合理范围内
+                    self.r_centres_ema.data = torch.clamp(self.r_centres_ema.data, min=1e-2, max=self.max_radius)
+                    
+                    # 更新角度缓冲区
+                    self.angular_cluster_size.data = self.angular_cluster_size * self.ema_decay + w_encodings * (1 - self.ema_decay)
+                    
+                    # 避免除零
+                    w_non_zero_clusters = (self.angular_cluster_size > 1e-5).float()
+                    w_cluster_size = self.angular_cluster_size + (1 - w_non_zero_clusters)
+                    
+                    # 计算新的角度码本
+                    w_dw = w_sum / w_cluster_size.unsqueeze(-1)
+                    self.angular_ema.data = self.angular_ema * self.ema_decay + w_dw * (1 - self.ema_decay)
+                    
+                    # 确保角度码本保持单位长度
+                    self.angular_ema.data = F.normalize(self.angular_ema.data, dim=-1)
+                
+                # 将EMA缓冲区复制回参数
+                self.r_centres.data.copy_(self.r_centres_ema)
+                self.angular_codebook.weight.data.copy_(self.angular_ema)
+
+        # 维持角度向量的单位长度（即使不使用EMA）
         with torch.no_grad():
             self.angular_codebook.weight.data.copy_(
                 F.normalize(self.angular_codebook.weight.data, dim=-1)
             )        
 
         return loss, z_q, perplexity, one_hot, ids.view(-1,1), codebook_usage, e_mean
-
-
-
